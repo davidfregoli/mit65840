@@ -16,12 +16,21 @@ import (
 // and reply for an RPC.
 //
 
-type ExampleArgs struct {
-	X int
+type SendCompleteTaskArgs struct {
+	Uid   string
+	Files CompletedTask
 }
+type SendCompleteTaskReply struct{}
 
-type ExampleReply struct {
-	Y int
+type GetFileArgs struct{}
+
+type GetFileReply struct {
+	File        string
+	ReduceCount int
+}
+type GetTaskArgs struct{}
+type GetTaskReply struct {
+	Task
 }
 
 // Add your RPC definitions here.

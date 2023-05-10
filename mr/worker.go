@@ -1,10 +1,18 @@
 package mr
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -13,50 +21,140 @@ type KeyValue struct {
 	Value string
 }
 
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-func ihash(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
-}
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+type CompletedTask map[int][]string
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	for {
+		task, err := CallGetTask()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if task == nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		if task.Type == "map" {
+			input, err := os.Open(task.Filename)
+			if err != nil {
+				log.Fatalf("cannot open %v", task.Filename)
+			}
+			content, err := ioutil.ReadAll(input)
+			input.Close()
+			if err != nil {
+				log.Fatalf("cannot read %v", task.Filename)
+			}
+			intermediate := map[int][]KeyValue{}
+			kva := mapf(task.Filename, string(content))
+			for _, entry := range kva {
+				hash := ihash(entry.Key)
+				bucket := hash % task.Reducers
+				intermediate[bucket] = append(intermediate[bucket], entry)
+			}
+			completed := CompletedTask{}
+			for bucket, data := range intermediate {
+				iname := "mr-inter-b" + strconv.Itoa(bucket) + "t" + task.Uid
+				ifile, _ := os.Create(iname)
+				for _, entry := range data {
+					fmt.Fprintf(ifile, "%v %v\n", entry.Key, entry.Value)
+				}
+				ifile.Close()
+				completed[bucket] = append(completed[bucket], iname)
+			}
+			CallSendCompleted(task.Uid, completed)
+		} else if task.Type == "reduce" {
+			filenames := strings.Split(task.Filename, ";")
+			intermediate := []KeyValue{}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+			for _, filename := range filenames {
+				file, err := os.Open(filename)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				scanner := bufio.NewScanner(file)
+				for scanner.Scan() {
+					kvarr := strings.Split(scanner.Text(), " ")
+					kv := KeyValue{Key: kvarr[0], Value: kvarr[1]}
+					intermediate = append(intermediate, kv)
+				}
+				file.Close()
+
+				if err := scanner.Err(); err != nil {
+					log.Fatal(err)
+				}
+			}
+
+			sort.Sort(ByKey(intermediate))
+
+			oname := "mr-out-" + strconv.Itoa(task.Seq)
+			ofile, _ := os.Create(oname)
+
+			//
+			// call Reduce on each distinct key in intermediate[],
+			// and print the result to mr-out-X.
+			//
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+				i = j
+			}
+			ofile.Close()
+			CallSendCompleted(task.Uid, nil)
+		}
+	}
 
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
+func CallGetTask() (*Task, error) {
 	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
+	args := GetTaskArgs{}
 	// declare a reply structure.
-	reply := ExampleReply{}
+	reply := GetTaskReply{}
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+	ok := call("Coordinator.GetTask", &args, &reply)
+	if !ok {
+		return nil, errors.New("cannot get task from server")
 	}
+	if reply.Task.Uid == "" {
+		return nil, nil
+	}
+	return &reply.Task, nil
+}
+
+func CallSendCompleted(uid string, completed CompletedTask) error {
+	// declare an argument structure.
+	args := SendCompleteTaskArgs{Uid: uid, Files: completed}
+	// declare a reply structure.
+	reply := SendCompleteTaskReply{}
+
+	ok := call("Coordinator.SendCompleted", &args, &reply)
+	if !ok {
+		return errors.New("cannot send completed tasks to server")
+	}
+	return nil
 }
 
 // send an RPC request to the coordinator, wait for the response.
@@ -78,4 +176,12 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+// use ihash(key) % NReduce to choose the reduce
+// task number for each KeyValue emitted by Map.
+func ihash(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32() & 0x7fffffff)
 }
