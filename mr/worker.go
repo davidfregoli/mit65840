@@ -32,37 +32,29 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 type CompletedTask map[int][]string
 
 // main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	for {
 		task, err := CallGetTask()
+
 		if err != nil {
 			log.Fatal(err)
 		}
+
 		if task == nil {
 			time.Sleep(time.Second)
 			continue
 		}
+
 		if task.Type == "map" {
-			input, err := os.Open(task.Filename)
-			if err != nil {
-				log.Fatalf("cannot open %v", task.Filename)
-			}
-			content, err := ioutil.ReadAll(input)
-			input.Close()
-			if err != nil {
-				log.Fatalf("cannot read %v", task.Filename)
-			}
-			intermediate := map[int][]KeyValue{}
-			kva := mapf(task.Filename, string(content))
+			input := readFile(task.Filename)
+			intermediates := map[int][]KeyValue{}
+			kva := mapf(task.Filename, input)
 			for _, entry := range kva {
-				hash := ihash(entry.Key)
-				bucket := hash % task.Reducers
-				intermediate[bucket] = append(intermediate[bucket], entry)
+				bucket := spread(entry.Key, task.Reducers)
+				intermediates[bucket] = append(intermediates[bucket], entry)
 			}
 			completed := CompletedTask{}
-			for bucket, data := range intermediate {
+			for bucket, data := range intermediates {
 				iname := "mr-inter-b" + strconv.Itoa(bucket) + "t" + task.Uid
 				ifile, _ := os.Create(iname)
 				for _, entry := range data {
@@ -72,7 +64,9 @@ func Worker(mapf func(string, string) []KeyValue,
 				completed[bucket] = append(completed[bucket], iname)
 			}
 			CallSendCompleted(task.Uid, completed)
-		} else if task.Type == "reduce" {
+		}
+
+		if task.Type == "reduce" {
 			filenames := strings.Split(task.Filename, ";")
 			intermediate := []KeyValue{}
 
@@ -104,9 +98,8 @@ func Worker(mapf func(string, string) []KeyValue,
 			// call Reduce on each distinct key in intermediate[],
 			// and print the result to mr-out-X.
 			//
-			i := 0
-			for i < len(intermediate) {
-				j := i + 1
+			for i, j := 0, 0; i < len(intermediate); i = j {
+				j = i + 1
 				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 					j++
 				}
@@ -118,14 +111,26 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				// this is the correct format for each line of Reduce output.
 				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
-
-				i = j
 			}
 			ofile.Close()
-			CallSendCompleted(task.Uid, nil)
+			CallSendCompleted(task.Uid, CompletedTask{})
 		}
+
 	}
 
+}
+
+func readFile(filename string) string {
+	input, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(input)
+	input.Close()
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	return string(content)
 }
 
 func CallGetTask() (*Task, error) {
@@ -165,7 +170,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		fmt.Println("Server shutdown or unreachable.")
+		os.Exit(0)
 	}
 	defer c.Close()
 
@@ -184,4 +190,8 @@ func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
+}
+
+func spread(key string, reducers int) int {
+	return ihash(key) % reducers
 }
