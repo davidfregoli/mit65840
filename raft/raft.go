@@ -60,7 +60,10 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentTerm int
+	votedFor    *int
+	timeout     int
+	timestamp   int
 }
 
 // return currentTerm and whether this server
@@ -124,12 +127,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
@@ -211,15 +220,31 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		if (rf.timestamp + rf.timeout) > int(time.Now().UnixMilli()) {
+			// pause for a random amount of time between 50 and 350
+			// milliseconds.
+			ms := 50 + (rand.Int63() % 300)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			continue
+		}
+		args := &AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+			Entries:  []LogEntry{},
+		}
+		for i, peer := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			go func(peer *labrpc.ClientEnd) {
+				reply := &AppendEntriesReply{}
+				peer.Call("Raft.AppendEntries", args, reply)
+			}(peer)
+		}
 	}
 }
 
@@ -238,6 +263,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.timeout = 100 + (rand.Int() % 100)
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -249,3 +275,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
+
+// my code
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+	termIsCurrent := args.Term >= rf.currentTerm
+	reply.Success = termIsCurrent
+	reply.Term = rf.currentTerm
+	return nil
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      []LogEntry
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+type LogEntry struct{}
