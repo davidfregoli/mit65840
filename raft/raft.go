@@ -221,30 +221,13 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		if (rf.timestamp + rf.timeout) > int(time.Now().UnixMilli()) {
-			// pause for a random amount of time between 50 and 350
-			// milliseconds.
-			ms := 50 + (rand.Int63() % 300)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			continue
-		}
-		args := &AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-			Entries:  []LogEntry{},
-		}
-		for i, peer := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go func(peer *labrpc.ClientEnd) {
-				reply := &AppendEntriesReply{}
-				peer.Call("Raft.AppendEntries", args, reply)
-			}(peer)
-		}
+
+		// pause for a random amount of time between 50 and 350
+		// milliseconds.
+		ms := 50 + (rand.Int63() % 300)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -263,7 +246,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.timeout = 100 + (rand.Int() % 100)
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -275,27 +257,3 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
-
-// my code
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
-	termIsCurrent := args.Term >= rf.currentTerm
-	reply.Success = termIsCurrent
-	reply.Term = rf.currentTerm
-	return nil
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	LeaderCommit int
-	Entries      []LogEntry
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-type LogEntry struct{}
