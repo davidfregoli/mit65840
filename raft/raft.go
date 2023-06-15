@@ -19,6 +19,9 @@ package raft
 
 import (
 	//	"bytes"
+
+	"io/ioutil"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -62,18 +65,29 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    *int
-	timeout     int
-	timestamp   int
+	timeout     time.Duration
+	voteCount   int
+	isLeader    bool
+
+	appendEntriesCh      chan AppendEntriesMsg
+	appendEntriesReplyCh chan AppendEntriesReply
+	requestVoteCh        chan RequestVoteMsg
+	voteCh               chan RequestVoteReply
+	stateCh              chan State
+
+	leaderTicker time.Ticker
+}
+
+type State struct {
+	term     int
+	isleader bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	state := <-rf.stateCh
+	return state.term, state.isleader
 }
 
 // save Raft's persistent state to stable storage,
@@ -121,29 +135,6 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
-}
-
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -219,15 +210,149 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type RequestVoteMsg struct {
+	RequestVoteArgs
+	ReplyCh chan RequestVoteReply
+}
+
+// example RequestVote RPC handler.
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
+	replyCh := make(chan RequestVoteReply)
+	rf.requestVoteCh <- RequestVoteMsg{
+		ReplyCh:         replyCh,
+		RequestVoteArgs: *args,
+	}
+	msg := <-replyCh
+	reply.Term = msg.Term
+	reply.VoteGranted = msg.VoteGranted
+}
+
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
+		if rf.isLeader {
+			select {
+			case rf.stateCh <- State{term: rf.currentTerm, isleader: true}:
+			case msg := <-rf.appendEntriesCh:
+				log.Printf("P%v <- P%v AppendEntries (T%v)", rf.me, msg.LeaderId, msg.Term)
+				msg.ReplyCh <- AppendEntriesReply{Term: rf.currentTerm, Success: msg.Term >= rf.currentTerm}
+				if rf.currentTerm < msg.Term {
+					rf.currentTerm = msg.Term
+					rf.isLeader = false
+				}
+			case msg := <-rf.appendEntriesReplyCh:
+				log.Printf("P%v <- AppendEntriesReply[%v] (T%v)", rf.me, msg.Success, msg.Term)
+				if msg.Term > rf.currentTerm {
+					rf.currentTerm = msg.Term
+					rf.isLeader = false
+				}
+			case msg := <-rf.requestVoteCh:
+				log.Printf("LEADER ASKED TO VOTE P%v <- P%v RequestVote (T%v)", rf.me, msg.CandidateId, msg.Term)
+				if msg.Term <= rf.currentTerm {
+					msg.ReplyCh <- RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
+					continue
+				}
+				rf.isLeader = false
+				rf.currentTerm = msg.Term
+				rf.votedFor = &msg.CandidateId
+				msg.ReplyCh <- RequestVoteReply{Term: msg.Term, VoteGranted: true}
+			case <-rf.voteCh:
+				// DISCARD
+			case <-rf.leaderTicker.C:
+				for i, peer := range rf.peers {
+					if i == rf.me {
+						continue
+					}
+					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
+					log.Printf("P%v -> P%v AppendEntries (T%v)", rf.me, i, args.Term)
+					go func(peer *labrpc.ClientEnd) {
+						reply := AppendEntriesReply{}
+						peer.Call("Raft.AppendEntries", &args, &reply)
+						rf.appendEntriesReplyCh <- reply
+					}(peer)
+				}
+			}
+		} else {
+			select {
+			case rf.stateCh <- State{term: rf.currentTerm, isleader: false}:
+			case msg := <-rf.appendEntriesCh:
+				log.Printf("P%v <- P%v AppendEntries (T%v)", rf.me, msg.LeaderId, msg.Term)
+				msg.ReplyCh <- AppendEntriesReply{Term: rf.currentTerm, Success: true}
+			case <-rf.appendEntriesReplyCh:
+				// DISCARD
+			case msg := <-rf.requestVoteCh:
+				log.Printf("P%v <- P%v RequestVote (T%v)", rf.me, msg.CandidateId, msg.Term)
+				if msg.Term <= rf.currentTerm {
+					msg.ReplyCh <- RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
+					continue
+				}
+				rf.currentTerm = msg.Term
+				rf.votedFor = &msg.CandidateId
+				msg.ReplyCh <- RequestVoteReply{Term: msg.Term, VoteGranted: true}
+			case msg := <-rf.voteCh:
+				log.Printf("P%v <- Vote[%v] (%v)", rf.me, msg.VoteGranted, msg.Term)
+				if msg.Term < rf.currentTerm {
+					continue
+				}
+				if msg.Term > rf.currentTerm {
+					rf.currentTerm = msg.Term
+					continue
+				}
+				if !msg.VoteGranted {
+					continue
+				}
+				rf.voteCount++
+				if rf.voteCount <= len(rf.peers)/2 {
+					continue
+				}
+				log.Printf("P%v Elected (%v)", rf.me, rf.currentTerm)
+				rf.isLeader = true
+			case <-time.After(rf.timeout):
+				log.Printf("P%v Timeout", rf.me)
+				rf.BecomeCandidate()
+			}
+		}
+	}
+}
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+func (rf *Raft) BecomeCandidate() {
+	rf.currentTerm++
+	rf.votedFor = &rf.me
+	rf.voteCount = 1
+	rf.timeout = RandomInterval()
+
+	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
+
+	for i, peer := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		log.Printf("P%v -> P%v RequestVote (T%v)", rf.me, i, args.Term)
+		go func(peer *labrpc.ClientEnd) {
+			reply := RequestVoteReply{}
+			peer.Call("Raft.RequestVote", &args, &reply)
+			rf.voteCh <- reply
+		}(peer)
 	}
 }
 
@@ -240,14 +365,23 @@ func (rf *Raft) ticker() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.SetOutput(ioutil.Discard)
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.timeout = RandomInterval()
+	rf.appendEntriesCh = make(chan AppendEntriesMsg)
+	rf.appendEntriesReplyCh = make(chan AppendEntriesReply)
+	rf.requestVoteCh = make(chan RequestVoteMsg)
+	rf.voteCh = make(chan RequestVoteReply)
+	rf.stateCh = make(chan State)
+	rf.leaderTicker = *time.NewTicker(100 * time.Millisecond)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -256,4 +390,40 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func RandomInterval() time.Duration {
+	return time.Duration(150+rand.Intn(301)) * time.Millisecond
+}
+
+type LogEntry struct{}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      []LogEntry
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+type AppendEntriesMsg struct {
+	AppendEntriesArgs
+	ReplyCh chan AppendEntriesReply
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	replyCh := make(chan AppendEntriesReply)
+	rf.appendEntriesCh <- AppendEntriesMsg{
+		ReplyCh:           replyCh,
+		AppendEntriesArgs: *args,
+	}
+	msg := <-replyCh
+	reply.Term = msg.Term
+	reply.Success = msg.Success
 }
